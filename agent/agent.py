@@ -1386,7 +1386,7 @@ class AgentHarness(Terminus2):
             "echo '@@MEM@@' && free -h 2>/dev/null | head -2 && "
             # Read key task files (README, instructions) to give agent context
             "echo '@@DOCS@@' && "
-            "for f in /app/README* /app/readme* /app/TASK* /app/task* /app/INSTRUCTIONS* /app/instructions* /app/*.md /app/*.txt; do "
+            "for f in /app/README* /app/readme* /app/TASK* /app/task* /app/INSTRUCTIONS* /app/instructions* /app/*.md /app/*.txt /app/tests/*.py /app/test/*.py /app/verify* /app/check* /app/grade* /app/Makefile /app/setup.py /app/requirements.txt; do "
             "  if [ -f \"$f\" ] && [ $(wc -c < \"$f\") -lt 5000 ]; then "
             "    echo \"--- $f ---\"; cat \"$f\"; echo; "
             "  fi; "
