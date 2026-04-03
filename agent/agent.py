@@ -510,8 +510,12 @@ class AgentHarness(Terminus2):
 
         max_dur = max(c.duration_sec for c in commands)
 
-        # Auto-parallel: multiple commands with at least one slow command
-        if len(commands) >= 2 and self._session_pool is not None:
+        # Auto-parallel: only for 2+ commands where at least one is slow (>3s).
+        # Fast commands don't benefit from parallelism — the Modal API overhead
+        # (~0.5-1s per env.exec call) dominates. See botbot V5 regression (0.050).
+        if (len(commands) >= 2
+            and self._session_pool is not None
+            and max_dur > 3.0):
             return await self._execute_commands_parallel(commands, session)
 
         total_duration = sum(c.duration_sec for c in commands)
