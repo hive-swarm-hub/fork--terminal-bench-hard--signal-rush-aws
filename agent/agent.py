@@ -480,6 +480,9 @@ class AgentHarness(Terminus2):
         # wget without timeout → inject --timeout=30
         elif re.match(r'^wget\s', stripped) and '--timeout' not in stripped:
             keystrokes = keystrokes.replace('wget ', 'wget --timeout=30 ', 1)
+        # apt-get without -y → inject -y to prevent interactive prompts
+        elif re.match(r'^(sudo\s+)?apt(-get)?\s+install\b', stripped) and ' -y' not in stripped:
+            keystrokes = re.sub(r'(apt(?:-get)?)\s+install', r'\1 install -y', keystrokes, count=1)
         return keystrokes
 
     async def _with_block_timeout(self, coro, timeout_sec: int = BLOCK_TIMEOUT_SEC):
