@@ -375,6 +375,7 @@ class AgentHarness(Terminus2):
         self._session_pool: TmuxSessionPool | None = None
         self._current_episode = 0
         self._consecutive_stalls = 0
+        self._last_pane_snapshot: str | None = None  # For smart stall detection
 
     async def _reset_terminal(self, session: TmuxSession) -> str:
         """Kill all processes and respawn a fresh bash shell.
@@ -447,6 +448,7 @@ class AgentHarness(Terminus2):
         await asyncio.sleep(1.0)
 
         self._consecutive_stalls = 0
+        self._last_pane_snapshot = None
         session._previous_buffer = None
 
         try:
@@ -472,6 +474,12 @@ class AgentHarness(Terminus2):
             keystrokes = re.sub(r'-f\b', '-100', keystrokes, count=1)
         elif re.match(r'^tail\s+--follow\b', stripped):
             keystrokes = keystrokes.replace('--follow', '-100', 1)
+        # curl without timeout → inject --connect-timeout 30 --max-time 300
+        elif re.match(r'^curl\s', stripped) and '--connect-timeout' not in stripped and '--max-time' not in stripped:
+            keystrokes = keystrokes.replace('curl ', 'curl --connect-timeout 30 --max-time 300 ', 1)
+        # wget without timeout → inject --timeout=30
+        elif re.match(r'^wget\s', stripped) and '--timeout' not in stripped:
+            keystrokes = keystrokes.replace('wget ', 'wget --timeout=30 ', 1)
         return keystrokes
 
     async def _with_block_timeout(self, coro, timeout_sec: int = BLOCK_TIMEOUT_SEC):
@@ -534,6 +542,9 @@ class AgentHarness(Terminus2):
         hard_timeout = min(max(total_duration, 10.0), 120.0)
         start = time.monotonic()
 
+        # Capture pane before polling to detect if content changes (alive vs stuck)
+        pre_pane = await session.capture_pane(capture_entire=True)
+
         # Phase 2: poll for the last marker
         await asyncio.sleep(min(0.3, total_duration))
         found_last = False
@@ -573,24 +584,47 @@ class AgentHarness(Terminus2):
         lines = [line for line in lines if not any(m in line for m in all_markers)]
         output = "\n".join(lines)
 
-        # If stall detected, append diagnostic info so the model knows
+        # Smart stall detection: distinguish "truly stuck" from "long-running process"
         if not found_last:
-            self._consecutive_stalls += 1
             stall_cmds = [c.keystrokes.strip()[:80] for c in commands[completed:]]
-            if self._consecutive_stalls >= 3:
+            # Check if pane content changed — if so, the process is alive, just slow
+            post_pane = pane_content if pane_content else await session.capture_pane(capture_entire=True)
+            pane_changed = (pre_pane != post_pane)
+            content_changed = bool(output.strip())
+
+            if pane_changed or content_changed:
+                # Process is alive but slow — DON'T escalate stall counter
+                # This prevents killing legitimate long-running tasks (training, VM, builds)
+                self._consecutive_stalls = max(0, self._consecutive_stalls - 1)
                 output += (
-                    f"\n\n[CRITICAL: Terminal has been stuck for {self._consecutive_stalls} "
-                    f"consecutive commands. Stalled on: {'; '.join(stall_cmds)}. "
-                    f"Call reset_terminal to kill all processes and get a fresh shell.]"
+                    f"\n\n[INFO: {len(commands) - completed} command(s) still running "
+                    f"after {hard_timeout:.0f}s (process is producing output). "
+                    f"Commands: {'; '.join(stall_cmds)}. "
+                    f"The process appears active — check progress with ps or tail.]"
                 )
             else:
-                output += (
-                    f"\n\n[WARNING: {len(commands) - completed} command(s) may not have "
-                    f"completed within {hard_timeout:.0f}s. Possibly stalled commands: "
-                    f"{'; '.join(stall_cmds)}. "
-                    f"If a process is stuck, try: kill the process, use Ctrl+C, "
-                    f"or call reset_terminal to get a fresh shell.]"
-                )
+                # Pane is truly frozen — escalate
+                self._consecutive_stalls += 1
+                if self._consecutive_stalls >= 5:
+                    output += (
+                        f"\n\n[CRITICAL: Terminal has been frozen for {self._consecutive_stalls} "
+                        f"consecutive commands with NO output. Stalled on: {'; '.join(stall_cmds)}. "
+                        f"Call reset_terminal to kill all processes and get a fresh shell.]"
+                    )
+                elif self._consecutive_stalls >= 3:
+                    output += (
+                        f"\n\n[WARNING: Terminal may be stuck ({self._consecutive_stalls} "
+                        f"consecutive timeouts with no output change). Stalled on: {'; '.join(stall_cmds)}. "
+                        f"Try: kill the process with kill -9, use Ctrl+C, "
+                        f"or call reset_terminal if nothing works.]"
+                    )
+                else:
+                    output += (
+                        f"\n\n[WARNING: {len(commands) - completed} command(s) may not have "
+                        f"completed within {hard_timeout:.0f}s. Possibly stalled commands: "
+                        f"{'; '.join(stall_cmds)}. "
+                        f"If a process is stuck, try: kill the process or use Ctrl+C.]"
+                    )
         else:
             self._consecutive_stalls = 0
 
