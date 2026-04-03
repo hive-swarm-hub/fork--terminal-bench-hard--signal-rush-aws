@@ -377,22 +377,39 @@ class AgentHarness(Terminus2):
         self._consecutive_stalls = 0
 
     async def _reset_terminal(self, session: TmuxSession) -> str:
-        """Kill all processes and respawn a fresh bash shell."""
+        """Kill all processes and respawn a fresh bash shell.
+
+        Uses environment.exec() which bypasses the stuck tmux pane entirely,
+        so this works even when the terminal is completely unresponsive.
+        Each step has a 15s timeout to avoid blocking on infra failures.
+        """
         env = session.environment
         session_name = session._session_name
 
+        # Step 1: Kill all user processes via environment.exec (bypasses tmux)
         try:
-            await env.exec(command="pkill -9 -u $(whoami) || true", user="root")
+            await asyncio.wait_for(
+                env.exec(command="pkill -9 -u $(whoami) || true", user="root"),
+                timeout=15,
+            )
         except Exception:
             pass
         await asyncio.sleep(0.5)
 
+        # Step 2: Kill the old tmux session
         try:
-            await env.exec(command=f"tmux kill-session -t {session_name} 2>/dev/null || true", user=session._user)
+            await asyncio.wait_for(
+                env.exec(
+                    command=f"tmux kill-session -t {session_name} 2>/dev/null || true",
+                    user=session._user,
+                ),
+                timeout=15,
+            )
         except Exception:
             pass
         await asyncio.sleep(0.5)
 
+        # Step 3: Start a fresh tmux session with the same name
         try:
             start_cmd = (
                 f"export TERM=xterm-256color && export SHELL=/bin/bash && "
@@ -401,20 +418,33 @@ class AgentHarness(Terminus2):
                 f"-d -s {session_name} 'bash --login'"
                 f'" /dev/null'
             )
-            await env.exec(command=start_cmd, user=session._user)
-        except Exception:
-            pass
+            result = await asyncio.wait_for(
+                env.exec(command=start_cmd, user=session._user),
+                timeout=15,
+            )
+            if result.return_code != 0:
+                self.logger.error(f"Failed to restart tmux session: {result.stderr}")
+        except Exception as e:
+            self.logger.error(f"Exception restarting tmux: {e}")
         await asyncio.sleep(0.5)
 
+        # Step 4: Re-disable pagers in the fresh shell
         try:
-            await session.send_keys("export PAGER=cat GIT_PAGER=cat MANPAGER=cat LESS='-F -X'\n", block=False, min_timeout_sec=0.3)
+            await session.send_keys(
+                "export PAGER=cat GIT_PAGER=cat MANPAGER=cat LESS='-F -X'\n",
+                block=False,
+                min_timeout_sec=0.3,
+            )
         except Exception:
             pass
 
+        # Step 5: cd back to /app
         try:
             await session.send_keys("cd /app\n", block=False, min_timeout_sec=0.3)
         except Exception:
             pass
+
+        await asyncio.sleep(1.0)
 
         self._consecutive_stalls = 0
         session._previous_buffer = None
@@ -424,7 +454,25 @@ class AgentHarness(Terminus2):
         except Exception:
             output = "[Terminal reset complete. Fresh bash shell ready.]"
 
+        self.logger.info("Terminal reset completed successfully")
+
         return f"[TERMINAL RESET] All processes killed. Fresh bash shell ready in /app.\n\n{output}"
+
+    @staticmethod
+    def _sanitize_command(keystrokes: str) -> str:
+        """Rewrite known-dangerous command patterns at infrastructure level.
+
+        This prevents terminal stalls without relying on the model following
+        prompt instructions (which V4 and V9 proved is unreliable).
+        """
+        import re
+        stripped = keystrokes.strip()
+        # tail -f → tail -100 (tail -f blocks terminal permanently)
+        if re.match(r'^tail\s+(-[nN]\s*\d+\s+)?-f\b', stripped):
+            keystrokes = re.sub(r'-f\b', '-100', keystrokes, count=1)
+        elif re.match(r'^tail\s+--follow\b', stripped):
+            keystrokes = keystrokes.replace('--follow', '-100', 1)
+        return keystrokes
 
     async def _with_block_timeout(self, coro, timeout_sec: int = BLOCK_TIMEOUT_SEC):
         """Wrap coroutine with block detection timeout."""
@@ -444,6 +492,10 @@ class AgentHarness(Terminus2):
         if not commands:
             output = await session.get_incremental_output()
             return False, self._limit_output_length(output)
+
+        # Sanitize commands at infrastructure level
+        for cmd in commands:
+            cmd.keystrokes = self._sanitize_command(cmd.keystrokes)
 
         max_dur = max(c.duration_sec for c in commands)
 
@@ -555,6 +607,10 @@ class AgentHarness(Terminus2):
         Benchmark shows parallel ops take same time as single op (~320ms).
         """
         pool = self._session_pool
+
+        # Sanitize commands at infrastructure level
+        for cmd in commands:
+            cmd.keystrokes = self._sanitize_command(cmd.keystrokes)
 
         # Filter empty commands
         real_cmds = [(i, cmd) for i, cmd in enumerate(commands) if cmd.keystrokes.strip()]
@@ -1556,10 +1612,20 @@ class AgentHarness(Terminus2):
 
             if reset_terminal:
                 self.logger.info("Agent requested terminal reset")
-                reset_output = await self._with_block_timeout(
-                    self._reset_terminal(self._session)
-                )
-                observation = reset_output
+                try:
+                    reset_output = await asyncio.wait_for(
+                        self._reset_terminal(self._session),
+                        timeout=60,  # 60s should be plenty for a reset
+                    )
+                    observation = reset_output
+                except (asyncio.TimeoutError, Exception) as e:
+                    self.logger.error(f"Terminal reset failed: {e}")
+                    self._consecutive_stalls = 0
+                    observation = (
+                        f"[TERMINAL RESET FAILED: {e}. "
+                        f"The terminal may still be stuck. Try running commands normally — "
+                        f"the session may have partially recovered.]"
+                    )
                 # Record trajectory step
                 cache_tokens_used = chat.total_cache_tokens - tokens_before_cache
                 step_cost = chat.total_cost - cost_before
